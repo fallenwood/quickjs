@@ -22,3 +22,9 @@ unicode
 unicode_gen
 run_octane
 run_sunspider_like
+.xmake
+build
+compile_commands.json
+bin
+*.exe
+*.dll

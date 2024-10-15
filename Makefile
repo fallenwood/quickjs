@@ -29,9 +29,10 @@ ifeq ($(shell uname -s),FreeBSD)
 CONFIG_FREEBSD=y
 endif
 # Windows cross compilation from Linux
-#CONFIG_WIN32=y
+CONFIG_WIN32=y
+CONFIG_MSYS=y
 # use link time optimization (smaller and faster executables but slower build)
-#CONFIG_LTO=y
+CONFIG_LTO=y
 # consider warnings as errors (for development)
 #CONFIG_WERROR=y
 # force 32 bit build for some utilities
@@ -79,10 +80,10 @@ CONFIG_LTO=
 endif
 
 ifdef CONFIG_WIN32
-  ifdef CONFIG_M32
-    CROSS_PREFIX?=i686-w64-mingw32-
-  else
-    CROSS_PREFIX?=x86_64-w64-mingw32-
+    ifdef CONFIG_M32
+      CROSS_PREFIX?=i686-w64-mingw32-
+    else
+      CROSS_PREFIX?=x86_64-w64-mingw32-
   endif
   EXE=.exe
 else
@@ -129,6 +130,9 @@ else
     AR=$(CROSS_PREFIX)gcc-ar
   else
     AR=$(CROSS_PREFIX)ar
+  endif
+  ifdef CONFIG_MSYS
+    AR=ar
   endif
 endif
 STRIP?=$(CROSS_PREFIX)strip
@@ -217,9 +221,11 @@ ifeq ($(CROSS_PREFIX),)
 ifndef CONFIG_ASAN
 ifndef CONFIG_MSAN
 ifndef CONFIG_UBSAN
+ifndef CONFIG_MSYS
 PROGS+=examples/hello examples/hello_module examples/test_fib
 ifdef CONFIG_SHARED_LIBS
 PROGS+=examples/fib.so examples/point.so
+endif
 endif
 endif
 endif
@@ -238,6 +244,9 @@ endif
 HOST_LIBS=-lm -ldl -lpthread
 LIBS=-lm
 ifndef CONFIG_WIN32
+LIBS+=-ldl -lpthread
+endif
+ifdef CONFIG_MSYS
 LIBS+=-ldl -lpthread
 endif
 LIBS+=$(EXTRA_LIBS)
