@@ -21,7 +21,6 @@ pub fn build(b: *std.Build) void {
             "libregexp.c",
             "libunicode.c",
             "quickjs.c",
-            "xsum.c",
             "quickjs-libc.c",
         },
         .flags = &flags,

@@ -50,7 +50,7 @@ extern "C" {
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
-#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__)
+#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !defined(__DJGPP)
 #include <errno.h>
 #include <pthread.h>
 #endif
@@ -63,6 +63,9 @@ extern "C" {
 #define JS_EXTERN __attribute__((visibility("default")))
 #else
 #define JS_EXTERN __declspec(dllexport) /* nothing */
+#if defined(__sun)
+#undef __maybe_unused
+#endif
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -79,15 +82,6 @@ extern "C" {
 #  define force_inline inline __attribute__((always_inline))
 #  define no_inline __attribute__((noinline))
 #  define __maybe_unused __attribute__((unused))
-#endif
-
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <math.h>
-#define INF INFINITY
-#define NEG_INF -INFINITY
-#else
-#define INF (1.0/0.0)
-#define NEG_INF (-1.0/0.0)
 #endif
 
 #ifndef offsetof
@@ -450,23 +444,44 @@ typedef struct DynBuf {
 
 void dbuf_init(DynBuf *s);
 void dbuf_init2(DynBuf *s, void *opaque, DynBufReallocFunc *realloc_func);
-int dbuf_realloc(DynBuf *s, size_t new_size);
-int dbuf_write(DynBuf *s, size_t offset, const void *data, size_t len);
+int dbuf_claim(DynBuf *s, size_t len);
 int dbuf_put(DynBuf *s, const void *data, size_t len);
 int dbuf_put_self(DynBuf *s, size_t offset, size_t len);
-int dbuf_putc(DynBuf *s, uint8_t c);
+int __dbuf_putc(DynBuf *s, uint8_t c);
+int __dbuf_put_u16(DynBuf *s, uint16_t val);
+int __dbuf_put_u32(DynBuf *s, uint32_t val);
+int __dbuf_put_u64(DynBuf *s, uint64_t val);
 int dbuf_putstr(DynBuf *s, const char *str);
+static inline int dbuf_putc(DynBuf *s, uint8_t val)
+{
+    if (unlikely((s->allocated_size - s->size) < 1))
+        return __dbuf_putc(s, val);
+    s->buf[s->size++] = val;
+    return 0;
+}
 static inline int dbuf_put_u16(DynBuf *s, uint16_t val)
 {
-    return dbuf_put(s, (uint8_t *)&val, 2);
+    if (unlikely((s->allocated_size - s->size) < 2))
+        return __dbuf_put_u16(s, val);
+    put_u16(s->buf + s->size, val);
+    s->size += 2;
+    return 0;
 }
 static inline int dbuf_put_u32(DynBuf *s, uint32_t val)
 {
-    return dbuf_put(s, (uint8_t *)&val, 4);
+    if (unlikely((s->allocated_size - s->size) < 4))
+        return __dbuf_put_u32(s, val);
+    put_u32(s->buf + s->size, val);
+    s->size += 4;
+    return 0;
 }
 static inline int dbuf_put_u64(DynBuf *s, uint64_t val)
 {
-    return dbuf_put(s, (uint8_t *)&val, 8);
+    if (unlikely((s->allocated_size - s->size) < 8))
+        return __dbuf_put_u64(s, val);
+    put_u64(s->buf + s->size, val);
+    s->size += 8;
+    return 0;
 }
 int JS_PRINTF_FORMAT_ATTR(2, 3) dbuf_printf(DynBuf *s, JS_PRINTF_FORMAT const char *fmt, ...);
 void dbuf_free(DynBuf *s);
@@ -549,16 +564,6 @@ static inline uint8_t to_upper_ascii(uint8_t c) {
     return c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c;
 }
 
-extern char const digits36[36];
-size_t u32toa(char buf[minimum_length(11)], uint32_t n);
-size_t i32toa(char buf[minimum_length(12)], int32_t n);
-size_t u64toa(char buf[minimum_length(21)], uint64_t n);
-size_t i64toa(char buf[minimum_length(22)], int64_t n);
-size_t u32toa_radix(char buf[minimum_length(33)], uint32_t n, unsigned int base);
-size_t i32toa_radix(char buf[minimum_length(34)], int32_t n, unsigned base);
-size_t u64toa_radix(char buf[minimum_length(65)], uint64_t n, unsigned int base);
-size_t i64toa_radix(char buf[minimum_length(66)], int64_t n, unsigned int base);
-
 void rqsort(void *base, size_t nmemb, size_t size,
             int (*cmp)(const void *, const void *, void *),
             void *arg);
@@ -603,7 +608,7 @@ JS_EXTERN int js_exepath(char* buffer, size_t* size);
 
 /* Cross-platform threading APIs. */
 
-#if defined(EMSCRIPTEN) || defined(__wasi__)
+#if defined(EMSCRIPTEN) || defined(__wasi__) || defined(__DJGPP)
 
 #define JS_HAVE_THREADS 0
 
@@ -649,6 +654,25 @@ JS_EXTERN int js_thread_create(js_thread_t *thrd, void (*start)(void *), void *a
 JS_EXTERN int js_thread_join(js_thread_t thrd);
 
 #endif /* !defined(EMSCRIPTEN) && !defined(__wasi__) */
+
+// JS requires strict rounding behavior. Turn on 64-bits double precision
+// and disable x87 80-bits extended precision for intermediate floating-point
+// results. 0x300 is extended  precision, 0x200 is double precision.
+// Note that `*&cw` in the asm constraints looks redundant but isn't.
+#if defined(__i386__) && !defined(_MSC_VER)
+#define JS_X87_FPCW_SAVE_AND_ADJUST(cw)                                     \
+    unsigned short cw;                                                      \
+    __asm__ __volatile__("fnstcw %0" : "=m"(*&cw));                         \
+    do {                                                                    \
+        unsigned short t = 0x200 | (cw & ~0x300);                           \
+        __asm__ __volatile__("fldcw %0" : /*empty*/ : "m"(*&t));            \
+    } while (0)
+#define JS_X87_FPCW_RESTORE(cw)                                             \
+    __asm__ __volatile__("fldcw %0" : /*empty*/ : "m"(*&cw))
+#else
+#define JS_X87_FPCW_SAVE_AND_ADJUST(cw)
+#define JS_X87_FPCW_RESTORE(cw)
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" { */

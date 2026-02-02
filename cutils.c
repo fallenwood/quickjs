@@ -102,6 +102,10 @@ int js__has_suffix(const char *str, const char *suffix)
 
 static void *dbuf_default_realloc(void *opaque, void *ptr, size_t size)
 {
+    if (unlikely(size == 0)) {
+        free(ptr);
+        return NULL;
+    }
     return realloc(ptr, size);
 }
 
@@ -119,44 +123,37 @@ void dbuf_init(DynBuf *s)
     dbuf_init2(s, NULL, NULL);
 }
 
-/* return < 0 if error */
-int dbuf_realloc(DynBuf *s, size_t new_size)
+/* Try to allocate 'len' more bytes. return < 0 if error */
+int dbuf_claim(DynBuf *s, size_t len)
 {
-    size_t size;
+    size_t new_size, size, new_allocated_size;
     uint8_t *new_buf;
+    new_size = s->size + len;
+    if (new_size < len)
+        return -1; /* overflow */
     if (new_size > s->allocated_size) {
         if (s->error)
             return -1;
-        size = s->allocated_size * 3 / 2;
-        if (size > new_size)
-            new_size = size;
-        new_buf = s->realloc_func(s->opaque, s->buf, new_size);
+        size = s->allocated_size + (s->allocated_size / 2);
+        if (size < new_size || size < s->allocated_size) /* overflow test */
+            new_allocated_size = new_size;
+        else
+            new_allocated_size = size;
+        new_buf = s->realloc_func(s->opaque, s->buf, new_allocated_size);
         if (!new_buf) {
             s->error = true;
             return -1;
         }
         s->buf = new_buf;
-        s->allocated_size = new_size;
+        s->allocated_size = new_allocated_size;
     }
-    return 0;
-}
-
-int dbuf_write(DynBuf *s, size_t offset, const void *data, size_t len)
-{
-    size_t end;
-    end = offset + len;
-    if (dbuf_realloc(s, end))
-        return -1;
-    memcpy(s->buf + offset, data, len);
-    if (end > s->size)
-        s->size = end;
     return 0;
 }
 
 int dbuf_put(DynBuf *s, const void *data, size_t len)
 {
     if (unlikely((s->size + len) > s->allocated_size)) {
-        if (dbuf_realloc(s, s->size + len))
+        if (dbuf_claim(s, len))
             return -1;
     }
     if (len > 0) {
@@ -169,17 +166,34 @@ int dbuf_put(DynBuf *s, const void *data, size_t len)
 int dbuf_put_self(DynBuf *s, size_t offset, size_t len)
 {
     if (unlikely((s->size + len) > s->allocated_size)) {
-        if (dbuf_realloc(s, s->size + len))
+        if (dbuf_claim(s, len))
             return -1;
     }
-    memcpy(s->buf + s->size, s->buf + offset, len);
-    s->size += len;
+    if (len > 0) {
+        memcpy(s->buf + s->size, s->buf + offset, len);
+        s->size += len;
+    }
     return 0;
 }
 
-int dbuf_putc(DynBuf *s, uint8_t c)
+int __dbuf_putc(DynBuf *s, uint8_t c)
 {
     return dbuf_put(s, &c, 1);
+}
+
+int __dbuf_put_u16(DynBuf *s, uint16_t val)
+{
+    return dbuf_put(s, (uint8_t *)&val, 2);
+}
+
+int __dbuf_put_u32(DynBuf *s, uint32_t val)
+{
+    return dbuf_put(s, (uint8_t *)&val, 4);
+}
+
+int __dbuf_put_u64(DynBuf *s, uint64_t val)
+{
+    return dbuf_put(s, (uint8_t *)&val, 8);
 }
 
 int dbuf_putstr(DynBuf *s, const char *str)
@@ -200,7 +214,7 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) dbuf_printf(DynBuf *s, JS_PRINTF_FORMAT const ch
         /* fast case */
         return dbuf_put(s, (uint8_t *)buf, len);
     } else {
-        if (dbuf_realloc(s, s->size + len + 1))
+        if (dbuf_claim(s, len + 1))
             return -1;
         va_start(ap, fmt);
         vsnprintf((char *)(s->buf + s->size), s->allocated_size - s->size,
@@ -586,258 +600,6 @@ overflow:
     return j;
 }
 
-/*--- integer to string conversions --*/
-
-/* All conversion functions:
-   - require a destination array `buf` of sufficient length
-   - write the string representation at the beginning of `buf`
-   - null terminate the string
-   - return the string length
- */
-
-/* 2 <= base <= 36 */
-char const digits36[36] = {
-    '0','1','2','3','4','5','6','7','8','9',
-    'a','b','c','d','e','f','g','h','i','j',
-    'k','l','m','n','o','p','q','r','s','t',
-    'u','v','w','x','y','z'
-};
-
-
-#define USE_SPECIAL_RADIX_10  1  // special case base 10 radix conversions
-#define USE_SINGLE_CASE_FAST  1  // special case single digit numbers
-
-/* using u32toa_shift variant */
-
-#define gen_digit(buf, c)  if (is_be()) \
-            buf = (buf >> 8) | ((uint64_t)(c) << ((sizeof(buf) - 1) * 8)); \
-        else \
-            buf = (buf << 8) | (c)
-
-static size_t u7toa_shift(char dest[minimum_length(8)], uint32_t n)
-{
-    size_t len = 1;
-    uint64_t buf = 0;
-    while (n >= 10) {
-        uint32_t quo = n % 10;
-        n /= 10;
-        gen_digit(buf, '0' + quo);
-        len++;
-    }
-    gen_digit(buf, '0' + n);
-    memcpy(dest, &buf, sizeof buf);
-    return len;
-}
-
-static size_t u07toa_shift(char dest[minimum_length(8)], uint32_t n, size_t len)
-{
-    size_t i;
-    dest += len;
-    dest[7] = '\0';
-    for (i = 7; i-- > 1;) {
-        uint32_t quo = n % 10;
-        n /= 10;
-        dest[i] = (char)('0' + quo);
-    }
-    dest[i] = (char)('0' + n);
-    return len + 7;
-}
-
-size_t u32toa(char buf[minimum_length(11)], uint32_t n)
-{
-#ifdef USE_SINGLE_CASE_FAST /* 10% */
-    if (n < 10) {
-        buf[0] = (char)('0' + n);
-        buf[1] = '\0';
-        return 1;
-    }
-#endif
-#define TEN_POW_7 10000000
-    if (n >= TEN_POW_7) {
-        uint32_t quo = n / TEN_POW_7;
-        n %= TEN_POW_7;
-        size_t len = u7toa_shift(buf, quo);
-        return u07toa_shift(buf, n, len);
-    }
-    return u7toa_shift(buf, n);
-}
-
-size_t u64toa(char buf[minimum_length(21)], uint64_t n)
-{
-    if (likely(n < 0x100000000))
-        return u32toa(buf, n);
-
-    size_t len;
-    if (n >= TEN_POW_7) {
-        uint64_t n1 = n / TEN_POW_7;
-        n %= TEN_POW_7;
-        if (n1 >= TEN_POW_7) {
-            uint32_t quo = n1 / TEN_POW_7;
-            n1 %= TEN_POW_7;
-            len = u7toa_shift(buf, quo);
-            len = u07toa_shift(buf, n1, len);
-        } else {
-            len = u7toa_shift(buf, n1);
-        }
-        return u07toa_shift(buf, n, len);
-    }
-    return u7toa_shift(buf, n);
-}
-
-size_t i32toa(char buf[minimum_length(12)], int32_t n)
-{
-    if (likely(n >= 0))
-        return u32toa(buf, n);
-
-    buf[0] = '-';
-    return 1 + u32toa(buf + 1, -(uint32_t)n);
-}
-
-size_t i64toa(char buf[minimum_length(22)], int64_t n)
-{
-    if (likely(n >= 0))
-        return u64toa(buf, n);
-
-    buf[0] = '-';
-    return 1 + u64toa(buf + 1, -(uint64_t)n);
-}
-
-/* using u32toa_radix_length variant */
-
-static uint8_t const radix_shift[64] = {
-    0, 0, 1, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
-    4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-};
-
-size_t u32toa_radix(char buf[minimum_length(33)], uint32_t n, unsigned base)
-{
-    int shift;
-
-#ifdef USE_SPECIAL_RADIX_10
-    if (likely(base == 10))
-        return u32toa(buf, n);
-#endif
-    if (n < base) {
-        buf[0] = digits36[n];
-        buf[1] = '\0';
-        return 1;
-    }
-    shift = radix_shift[base & 63];
-    if (shift) {
-        uint32_t mask = (1 << shift) - 1;
-        size_t len = (32 - clz32(n) + shift - 1) / shift;
-        size_t last = n & mask;
-        char *end = buf + len;
-        n >>= shift;
-        *end-- = '\0';
-        *end-- = digits36[last];
-        while (n >= base) {
-            size_t quo = n & mask;
-            n >>= shift;
-            *end-- = digits36[quo];
-        }
-        *end = digits36[n];
-        return len;
-    } else {
-        size_t len = 2;
-        size_t last = n % base;
-        n /= base;
-        uint32_t nbase = base;
-        while (n >= nbase) {
-            nbase *= base;
-            len++;
-        }
-        char *end = buf + len;
-        *end-- = '\0';
-        *end-- = digits36[last];
-        while (n >= base) {
-            size_t quo = n % base;
-            n /= base;
-            *end-- = digits36[quo];
-        }
-        *end = digits36[n];
-        return len;
-    }
-}
-
-size_t u64toa_radix(char buf[minimum_length(65)], uint64_t n, unsigned base)
-{
-    int shift;
-
-#ifdef USE_SPECIAL_RADIX_10
-    if (likely(base == 10))
-        return u64toa(buf, n);
-#endif
-    shift = radix_shift[base & 63];
-    if (shift) {
-        if (n < base) {
-            buf[0] = digits36[n];
-            buf[1] = '\0';
-            return 1;
-        }
-        uint64_t mask = (1 << shift) - 1;
-        size_t len = (64 - clz64(n) + shift - 1) / shift;
-        size_t last = n & mask;
-        char *end = buf + len;
-        n >>= shift;
-        *end-- = '\0';
-        *end-- = digits36[last];
-        while (n >= base) {
-            size_t quo = n & mask;
-            n >>= shift;
-            *end-- = digits36[quo];
-        }
-        *end = digits36[n];
-        return len;
-    } else {
-        if (likely(n < 0x100000000))
-            return u32toa_radix(buf, n, base);
-        size_t last = n % base;
-        n /= base;
-        uint64_t nbase = base;
-        size_t len = 2;
-        while (n >= nbase) {
-            nbase *= base;
-            len++;
-        }
-        char *end = buf + len;
-        *end-- = '\0';
-        *end-- = digits36[last];
-        while (n >= base) {
-            size_t quo = n % base;
-            n /= base;
-            *end-- = digits36[quo];
-        }
-        *end = digits36[n];
-        return len;
-    }
-}
-
-size_t i32toa_radix(char buf[minimum_length(34)], int32_t n, unsigned int base)
-{
-    if (likely(n >= 0))
-        return u32toa_radix(buf, n, base);
-
-    buf[0] = '-';
-    return 1 + u32toa_radix(buf + 1, -(uint32_t)n, base);
-}
-
-size_t i64toa_radix(char buf[minimum_length(66)], int64_t n, unsigned int base)
-{
-    if (likely(n >= 0))
-        return u64toa_radix(buf, n, base);
-
-    buf[0] = '-';
-    return 1 + u64toa_radix(buf + 1, -(uint64_t)n, base);
-}
-
-#undef gen_digit
-#undef TEN_POW_7
-#undef USE_SPECIAL_RADIX_10
-#undef USE_SINGLE_CASE_FAST
-
 /*---- sorting with opaque argument ----*/
 
 typedef void (*exchange_f)(void *a, void *b, size_t size);
@@ -1185,12 +947,19 @@ uint64_t js__hrtime_ns(void) {
 }
 #else
 uint64_t js__hrtime_ns(void) {
+#ifdef __DJGPP
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL))
+    abort();
+  return tv.tv_sec * NANOSEC + tv.tv_usec * 1000;
+#else
   struct timespec t;
 
   if (clock_gettime(CLOCK_MONOTONIC, &t))
     abort();
 
   return t.tv_sec * NANOSEC + t.tv_nsec;
+#endif
 }
 #endif
 
