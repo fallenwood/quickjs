@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     qjsMod.addCSourceFiles(.{
         .files = &.{
             "cutils.c",
+            "dtoa.c",
             "libregexp.c",
             "libunicode.c",
             "quickjs.c",
